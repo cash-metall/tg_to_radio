@@ -46,7 +46,8 @@ MORSE_UNIT = 0.1                # длительность точки
 MORSE_FREQ = 800                # частота сигнала
 
 # VOX настройки
-VOX_THRESHOLD = 500      # порог активации VOX (уровень сигнала)
+VOX_THRESHOLD_ON = 500      # порог активации VOX (уровень сигнала)
+VOX_THRESHOLD_OFF = 150      # порог деактивации VOX (уровень сигнала)
 VOX_SILENCE_TIME = 2.0   # время тишины для остановки записи (сек)
 AUDIO_CHUNK = 1024       # размер буфера аудио
 AUDIO_FORMAT = pyaudio.paInt16
@@ -355,6 +356,7 @@ def vox_monitor():
     global vox_active, recording, audio_frames
     
     p = pyaudio.PyAudio()
+    stream = None
     
     try:
         stream = p.open(
@@ -380,11 +382,11 @@ def vox_monitor():
             
             rms = calculate_rms(data)
             
-            if rms > VOX_THRESHOLD:
+            if rms > VOX_THRESHOLD_ON:
                 # Сигнал обнаружен
+                silence_start = None
                 if not vox_active:
                     vox_active = True
-                    silence_start = None
                     print(f"VOX активирован (уровень: {rms:.0f})")
                     
                     # Запускаем запись в отдельном потоке
@@ -392,7 +394,8 @@ def vox_monitor():
                         recording_thread = threading.Thread(target=record_audio)
                         recording_thread.daemon = True
                         recording_thread.start()
-                
+            elif vox_active and rms > VOX_THRESHOLD_OFF:
+                silence_start = None
             else:
                 # Сигнал отсутствует
                 if vox_active:
