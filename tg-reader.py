@@ -11,6 +11,7 @@ import wave
 from datetime import datetime
 import asyncio
 from contextlib import contextmanager
+from asyncio import run_coroutine_threadsafe
 
 if os.name == 'nt':
     # Настройка корректной работы asyncio и кодировки консоли в Windows
@@ -40,20 +41,19 @@ BEEP_FREQ = 1000     # частота (Гц)
 BEEP_DURATION = 1.5  # длительность (сек)
 
 # Morse настройки
-MORSE_INTERVAL = 300            # интервал между передачами (сек)
 MORSE_MESSAGE = "UB9HEQ"
 MORSE_UNIT = 0.1                # длительность точки
 MORSE_FREQ = 800                # частота сигнала
 
 # VOX настройки
 VOX_THRESHOLD = 500      # порог активации VOX (уровень сигнала)
-VOX_SILENCE_TIME = 1.0   # время тишины для остановки записи (сек)
+VOX_SILENCE_TIME = 2.0   # время тишины для остановки записи (сек)
 AUDIO_CHUNK = 1024       # размер буфера аудио
 AUDIO_FORMAT = pyaudio.paInt16
 AUDIO_CHANNELS = 1       # моно
 AUDIO_RATE = 44100       # частота дискретизации
 INPUT_DEVICE_INDEX = 0  # None = использовать устройство по умолчанию
-MIN_RECORDING_DURATION = 10.0  # минимальная длительность записи для отправки (сек)
+MIN_RECORDING_DURATION = 5.0  # минимальная длительность записи для отправки (сек)
 
 # Глобальные переменные для VOX и передачи
 vox_active = False
@@ -63,6 +63,7 @@ chat_ids = set()  # множество chat_id для отправки сооб�
 app_instance = None
 transmitting_event = threading.Event()
 transmission_lock = threading.Lock()
+main_loop = None 
 
 def load_config():
     global TOKEN
@@ -135,6 +136,7 @@ def play_morse_message(message: str):
     letter_gap = unit * 3
     word_gap = unit * 7
 
+    beep(BEEP_DURATION)
     words = message.upper().split(' ')
     for word_index, word in enumerate(words):
         for letter_index, letter in enumerate(word):
@@ -152,12 +154,26 @@ def play_morse_message(message: str):
             time.sleep(word_gap)
 
 
-def morse_broadcast_loop():
-    """Периодически передает заранее заданное сообщение азбукой Морзе."""
-    while True:
-        with radio_transmission():
-            play_morse_message(MORSE_MESSAGE)
-        time.sleep(MORSE_INTERVAL)
+async def morse_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /morse - передает callsign азбукой Морзе."""
+    await update.message.reply_text(
+        f"Передача callsign '{MORSE_MESSAGE}' азбукой Морзе..."
+    )
+    
+    # Запускаем передачу в отдельном потоке, чтобы не блокировать async event loop
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: play_morse_with_transmission()
+    )
+    
+    await update.message.reply_text("Передача завершена.")
+
+
+def play_morse_with_transmission():
+    """Вспомогательная функция для передачи Морзе с блокировкой передачи."""
+    with radio_transmission():
+        play_morse_message(MORSE_MESSAGE)
 
 
 async def start_listen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,7 +296,7 @@ def save_and_convert_audio():
     try:
         wf = wave.open(wav_filename, 'wb')
         wf.setnchannels(AUDIO_CHANNELS)
-        wf.setsampwidth(pyaudio.PyAudio().get_sample_size(AUDIO_FORMAT))
+        wf.setsampwidth(2) # 16-bit
         wf.setframerate(AUDIO_RATE)
         wf.writeframes(b''.join(audio_frames))
         wf.close()
@@ -406,19 +422,12 @@ def vox_monitor():
                         ogg_file = save_and_convert_audio()
                         
                         # Отправляем в Telegram
-                        if ogg_file and app_instance:
-                            # Используем asyncio для вызова async функции из синхронного потока
-                            import asyncio
+                        if ogg_file and app_instance and main_loop:
                             try:
-                                # Создаем новый event loop для отправки сообщения
-                                # Это безопасно, так как мы в отдельном потоке
-                                loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(loop)
-                                loop.run_until_complete(send_voice_message(ogg_file))
-                                loop.close()
+                                fut = run_coroutine_threadsafe(send_voice_message(ogg_file), main_loop)
+                                fut.result()  # по желанию: дождаться или можно не вызывать
                             except Exception as e:
                                 print(f"Ошибка при отправке сообщения: {e}")
-                        
                         silence_start = None
                 else:
                     silence_start = None
@@ -428,8 +437,9 @@ def vox_monitor():
     except Exception as e:
         print(f"Ошибка в VOX мониторинге: {e}")
     finally:
-        stream.stop_stream()
-        stream.close()
+        if stream is not None:
+            stream.stop_stream()
+            stream.close()
         p.terminate()
 
 
@@ -445,8 +455,8 @@ def list_audio_devices():
     p.terminate()
 
 
-def main():
-    global app_instance
+async def telegram_main():
+    global app_instance, main_loop
     
     # Показываем список устройств (можно закомментировать после настройки)
     list_audio_devices()
@@ -455,22 +465,26 @@ def main():
     app_instance = Application.builder().token(TOKEN).build()
     app_instance.add_handler(CommandHandler("start_listen", start_listen_handler))
     app_instance.add_handler(CommandHandler("stop_listen", stop_listen_handler))
+    app_instance.add_handler(CommandHandler("morse", morse_handler))
     app_instance.add_handler(MessageHandler(filters.VOICE, voice_handler))
     
-    # Запускаем VOX мониторинг в отдельном потоке
-    vox_thread = threading.Thread(target=vox_monitor)
-    vox_thread.daemon = True
-    vox_thread.start()
+    main_loop = asyncio.get_running_loop()
 
-    # Периодическая передача сообщения азбукой Морзе
-    morse_thread = threading.Thread(target=morse_broadcast_loop)
-    morse_thread.daemon = True
-    morse_thread.start()
+    # Запускаем VOX мониторинг в отдельном потоке
+    vox_thread = threading.Thread(target=vox_monitor, daemon=True)
+    vox_thread.start()
     
     print("Бот запущен. Ожидание сообщений и мониторинг VOX...")
     
     # Запускаем Telegram бота
-    app_instance.run_polling()
+    async with app_instance:
+        await app_instance.start()
+        await app_instance.updater.start_polling()
+        # вечное ожидание (Ctrl+C прервёт)
+        await asyncio.Event().wait()
+
+def main():
+    asyncio.run(telegram_main())
 
 if __name__ == "__main__":
     main()
