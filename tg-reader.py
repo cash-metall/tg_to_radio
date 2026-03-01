@@ -12,6 +12,7 @@ from datetime import datetime
 import asyncio
 from contextlib import contextmanager
 from asyncio import run_coroutine_threadsafe
+import logging
 
 if os.name == 'nt':
     # Настройка корректной работы asyncio и кодировки консоли в Windows
@@ -58,22 +59,60 @@ MIN_RECORDING_DURATION = 5.0  # минимальная длительность 
 
 # Глобальные переменные для VOX и передачи
 vox_active = False
-recording = False
 audio_frames = []
 chat_ids = set()  # множество chat_id для отправки сообщений
 app_instance = None
 transmitting_event = threading.Event()
 transmission_lock = threading.Lock()
 main_loop = None 
+audio_lock = threading.Lock()
 
 def load_config():
-    global TOKEN
-    with open('config.json') as f:
-        data = json.load(f)
-    TOKEN = data['token']
+    """Load configuration values from `config.json`, falling back to defaults."""
+    global TOKEN, VOLUME, BEEP_VOLUME, BEEP_FREQ, BEEP_DURATION
+    global MORSE_MESSAGE, MORSE_UNIT, MORSE_FREQ
+    global VOX_THRESHOLD_ON, VOX_THRESHOLD_OFF, VOX_SILENCE_TIME
+    global AUDIO_CHUNK, AUDIO_CHANNELS, AUDIO_RATE, INPUT_DEVICE_INDEX
+    global MIN_RECORDING_DURATION
 
-    
+    try:
+        with open('config.json', 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print('config.json not found; using built-in defaults')
+        return
+    except Exception as e:
+        print(f'Failed to load config.json: {e}; using defaults')
+        return
+
+    TOKEN = data.get('token', TOKEN)
+    VOLUME = float(data.get('volume', VOLUME))
+    BEEP_VOLUME = float(data.get('beep_volume', BEEP_VOLUME))
+    BEEP_FREQ = int(data.get('beep_freq', BEEP_FREQ))
+    BEEP_DURATION = float(data.get('beep_duration', BEEP_DURATION))
+
+    MORSE_MESSAGE = data.get('morse_message', MORSE_MESSAGE)
+    MORSE_UNIT = float(data.get('morse_unit', MORSE_UNIT))
+    MORSE_FREQ = int(data.get('morse_freq', MORSE_FREQ))
+
+    VOX_THRESHOLD_ON = float(data.get('vox_threshold_on', VOX_THRESHOLD_ON))
+    VOX_THRESHOLD_OFF = float(data.get('vox_threshold_off', VOX_THRESHOLD_OFF))
+    VOX_SILENCE_TIME = float(data.get('vox_silence_time', VOX_SILENCE_TIME))
+
+    AUDIO_CHUNK = int(data.get('audio_chunk', AUDIO_CHUNK))
+    AUDIO_CHANNELS = int(data.get('audio_channels', AUDIO_CHANNELS))
+    AUDIO_RATE = int(data.get('audio_rate', AUDIO_RATE))
+
+    # Allow explicit null in config to mean default device
+    if 'input_device_index' in data:
+        INPUT_DEVICE_INDEX = data['input_device_index']
+
+    MIN_RECORDING_DURATION = float(data.get('min_recording_duration', MIN_RECORDING_DURATION))
+
+
 load_config()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 def play_tone(frequency: float, duration: float, volume: float = BEEP_VOLUME):
     subprocess.run([
@@ -90,7 +129,9 @@ def beep(duration):
 
 def is_radio_receiving() -> bool:
     """Проверяет, идет ли сейчас прием сигнала."""
-    return vox_active or recording
+    # Read shared state under lock to avoid race.
+    with audio_lock:
+        return bool(vox_active)
 
 
 def wait_for_reception_end(poll_interval: float = 0.1):
@@ -182,10 +223,9 @@ async def start_listen_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.message.chat_id
     chat_ids.add(chat_id)
     await update.message.reply_text(
-        "Вы подписались на получение сообщений с радиостанции. "
-        "Теперь вы будете получать все записи с радиостанции."
+        "Вы подписались на получение сообщений с радиостанции. Теперь вы будете получать все записи с радиостанции."
     )
-    print(f"Chat ID {chat_id} добавлен в список получателей")
+    logging.info("Chat ID %s добавлен в список получателей", chat_id)
 
 
 async def stop_listen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -193,14 +233,10 @@ async def stop_listen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.message.chat_id
     if chat_id in chat_ids:
         chat_ids.remove(chat_id)
-        await update.message.reply_text(
-            "Вы отписались от получения сообщений с радиостанции."
-        )
-        print(f"Chat ID {chat_id} удален из списка получателей")
+        await update.message.reply_text("Вы отписались от получения сообщений с радиостанции.")
+        logging.info("Chat ID %s удален из списка получателей", chat_id)
     else:
-        await update.message.reply_text(
-            "Вы не были подписаны на получение сообщений."
-        )
+        await update.message.reply_text("Вы не были подписаны на получение сообщений.")
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,6 +256,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ], capture_output=True)
 
     os.remove(file_path)
+    logging.info("Воспроизведено входящее голосовое сообщение и временный файл удалён")
 
 
 def calculate_rms(data):
@@ -242,67 +279,42 @@ def calculate_rms(data):
     return np.sqrt(mean_squared)
 
 
-def get_recording_duration_seconds() -> float:
-    """Возвращает длительность текущей записи в секундах."""
-    if not audio_frames or AUDIO_RATE <= 0:
+def get_recording_duration_seconds(frames=None) -> float:
+    """Возвращает длительность записи в секундах для переданных фреймов.
+
+    Если `frames` не переданы, используется глобальный `audio_frames`.
+    """
+    if frames is None:
+        frames = audio_frames
+    if not frames or AUDIO_RATE <= 0:
         return 0.0
     bytes_per_sample = 2  # paInt16
-    total_samples = sum(len(frame) // bytes_per_sample for frame in audio_frames)
+    total_samples = sum(len(frame) // bytes_per_sample for frame in frames)
     return total_samples / AUDIO_RATE
 
 
-def record_audio():
-    """Записывает аудио с микрофона"""
-    global recording, audio_frames
-    
-    p = pyaudio.PyAudio()
-    
-    try:
-        stream = p.open(
-            format=AUDIO_FORMAT,
-            channels=AUDIO_CHANNELS,
-            rate=AUDIO_RATE,
-            input=True,
-            input_device_index=INPUT_DEVICE_INDEX,
-            frames_per_buffer=AUDIO_CHUNK
-        )
-        
-        recording = True
-        audio_frames = []
-        
-        print("Начало записи...")
-        
-        while recording:
-            data = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
-            audio_frames.append(data)
-        
-        stream.stop_stream()
-        stream.close()
-        print("Запись завершена")
-        
-    except Exception as e:
-        print(f"Ошибка при записи: {e}")
-    finally:
-        p.terminate()
+# Recording is now handled inside `vox_monitor` to avoid multiple threads
+# opening the audio device concurrently and to centralize frame capture.
 
 
-def save_and_convert_audio():
-    """Сохраняет записанное аудио в WAV, затем конвертирует в OGG"""
-    if not audio_frames:
+def save_and_convert_audio(frames):
+    """Сохраняет переданные фреймы в WAV, затем конвертирует в OGG.
+
+    Эта функция не изменяет глобальный `audio_frames` — вызывающий код
+    должен передать копию массива фреймов, полученную под блокировкой.
+    """
+    if not frames:
         return None
-    
-    # Сохраняем во временный WAV файл
+
     wav_filename = f"recorded_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-    
     try:
         wf = wave.open(wav_filename, 'wb')
         wf.setnchannels(AUDIO_CHANNELS)
         wf.setsampwidth(2) # 16-bit
         wf.setframerate(AUDIO_RATE)
-        wf.writeframes(b''.join(audio_frames))
+        wf.writeframes(b''.join(frames))
         wf.close()
-        
-        # Конвертируем в OGG для Telegram
+
         ogg_filename = wav_filename.replace('.wav', '.ogg')
         subprocess.run([
             "ffmpeg", "-y", "-i", wav_filename,
@@ -310,13 +322,12 @@ def save_and_convert_audio():
             "-b:a", "32k",
             ogg_filename
         ], capture_output=True)
-        
-        # Удаляем временный WAV файл
+
         os.remove(wav_filename)
-        
+        logging.info("Converted and removed temporary wav: %s", wav_filename)
         return ogg_filename
     except Exception as e:
-        print(f"Ошибка при сохранении аудио: {e}")
+        logging.exception("Ошибка при сохранении аудио: %s", e)
         if os.path.exists(wav_filename):
             os.remove(wav_filename)
         return None
@@ -330,25 +341,19 @@ async def send_voice_message(ogg_file):
     try:
         if not os.path.exists(ogg_file):
             return
-        
         if not chat_ids:
-            print("Нет сохраненных chat_id для отправки сообщения")
+            logging.info("Нет сохраненных chat_id для отправки сообщения")
             return
-        
         for chat_id in chat_ids:
             with open(ogg_file, 'rb') as voice_file:
-                await app_instance.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=voice_file,
-                    caption="Сообщение с радиостанции"
-                )
-        print(f"Сообщение отправлено в {len(chat_ids)} чат(ов)")
+                await app_instance.bot.send_voice(chat_id=chat_id, voice=voice_file, caption="Сообщение с радиостанции")
+        logging.info("Сообщение отправлено в %d чат(ов)", len(chat_ids))
     except Exception as e:
-        print(f"Ошибка при отправке сообщения: {e}")
+        logging.exception("Ошибка при отправке сообщения: %s", e)
     finally:
-        # Удаляем временный файл
         if ogg_file and os.path.exists(ogg_file):
             os.remove(ogg_file)
+            logging.info("Временный ogg-файл удалён: %s", ogg_file)
 
 
 def vox_monitor():
@@ -369,33 +374,34 @@ def vox_monitor():
         )
         
         silence_start = None
-        recording_thread = None
-        
-        print("VOX мониторинг запущен...")
-        
+        logging.info("VOX мониторинг запущен")
+
         while True:
             data = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
-            
+
             if transmitting_event.is_set():
                 silence_start = None
                 continue
-            
+
             rms = calculate_rms(data)
-            
+
             if rms > VOX_THRESHOLD_ON:
                 # Сигнал обнаружен
                 silence_start = None
                 if not vox_active:
                     vox_active = True
-                    print(f"VOX активирован (уровень: {rms:.0f})")
-                    
-                    # Запускаем запись в отдельном потоке
-                    if not recording:
-                        recording_thread = threading.Thread(target=record_audio)
-                        recording_thread.daemon = True
-                        recording_thread.start()
+                    logging.info("VOX активирован (уровень: %.0f)", rms)
+
+                # Собираем фреймы под блокировкой
+                with audio_lock:
+                    audio_frames.append(data)
+
             elif vox_active and rms > VOX_THRESHOLD_OFF:
+                # Низкий, но всё ещё выше порога отключения — продолжаем сбор
                 silence_start = None
+                with audio_lock:
+                    audio_frames.append(data)
+
             else:
                 # Сигнал отсутствует
                 if vox_active:
@@ -404,41 +410,40 @@ def vox_monitor():
                     elif time.time() - silence_start >= VOX_SILENCE_TIME:
                         # Тишина длится достаточно долго - останавливаем запись
                         vox_active = False
-                        recording = False
-                        print("VOX деактивирован - обработка записи...")
-                        
-                        # Ждем завершения записи
-                        if recording_thread and recording_thread.is_alive():
-                            recording_thread.join(timeout=2.0)
-                        
-                        duration = get_recording_duration_seconds()
+                        logging.info("VOX деактивирован - обработка записи")
+
+                        # Копируем фреймы под блокировкой и очищаем буфер
+                        with audio_lock:
+                            frames_copy = list(audio_frames)
+                            audio_frames.clear()
+
+                        duration = get_recording_duration_seconds(frames_copy)
                         if duration < MIN_RECORDING_DURATION:
                             print(
                                 f"Запись отклонена: длительность {duration:.1f} с "
                                 f"< минимальных {MIN_RECORDING_DURATION:.1f} с"
                             )
-                            audio_frames.clear()
                             silence_start = None
                             continue
 
-                        # Сохраняем и конвертируем аудио
-                        ogg_file = save_and_convert_audio()
-                        
+                        # Сохраняем и конвертируем аудио из копии
+                        ogg_file = save_and_convert_audio(frames_copy)
+
                         # Отправляем в Telegram
                         if ogg_file and app_instance and main_loop:
                             try:
                                 fut = run_coroutine_threadsafe(send_voice_message(ogg_file), main_loop)
-                                fut.result()  # по желанию: дождаться или можно не вызывать
+                                fut.result()
                             except Exception as e:
-                                print(f"Ошибка при отправке сообщения: {e}")
+                                logging.exception("Ошибка при отправке сообщения: %s", e)
                         silence_start = None
                 else:
                     silence_start = None
         
     except KeyboardInterrupt:
-        print("VOX мониторинг остановлен")
+        logging.info("VOX мониторинг остановлен")
     except Exception as e:
-        print(f"Ошибка в VOX мониторинге: {e}")
+        logging.exception("Ошибка в VOX мониторинге: %s", e)
     finally:
         if stream is not None:
             stream.stop_stream()
@@ -477,7 +482,7 @@ async def telegram_main():
     vox_thread = threading.Thread(target=vox_monitor, daemon=True)
     vox_thread.start()
     
-    print("Бот запущен. Ожидание сообщений и мониторинг VOX...")
+    logging.info("Бот запущен. Ожидание сообщений и мониторинг VOX...")
     
     # Запускаем Telegram бота
     async with app_instance:
